@@ -15,9 +15,15 @@ using StackExchange.Redis;
 
 Console.WriteLine("Hello, World!");
 
+
+
 var muxer = await ConnectionMultiplexer.ConnectAsync("localhost,$SELECT=");
 
 var db = muxer.GetDatabase();
+
+db.Execute("FLUSHDB");
+
+db.Execute("FT.CREATE", "stock-vectors", "SCHEMA", "vector", "VECTOR", "FLAT", 6, "TYPE", "FLOAT32", "DIM", 17, "DISTANCE_METRIC", "L2");
 
 var builder = new ConfigurationBuilder();
 
@@ -101,8 +107,6 @@ foreach (var security in securities)
 await Task.WhenAll(tasks);
 tasks.Clear();
 
-
-
 var thread = new Thread(async () =>
 {
     
@@ -137,13 +141,8 @@ var thread = new Thread(async () =>
                 {
                     foreach (var securityGroup in msg.Trades.GroupBy(x => x.Symbol))
                     {
-                        var messageString = $"{securityGroup.Key} - {securityGroup.Max(x => x.Price)}";
-                        var messageStringVolume = $"{securityGroup.Key} - {securityGroup.Sum(x => x.Volume)}";
-                        
                         tasks.Add(db.TimeSeriesAddAsync($"ts:{securityGroup.Key}:price", new TimeStamp(securityGroup.First().Timestamp), securityGroup.Average(x => x.Price), duplicatePolicy: TsDuplicatePolicy.LAST));
                         tasks.Add(db.TimeSeriesAddAsync($"ts:{securityGroup.Key}:volume", new TimeStamp(securityGroup.First().Timestamp), securityGroup.Sum(x => x.Volume), duplicatePolicy: TsDuplicatePolicy.SUM));
-                        // Console.WriteLine(messageString);
-                        // Console.WriteLine(messageStringVolume);
                     }
 
                     await Task.WhenAll(tasks);
@@ -160,44 +159,87 @@ var thread = new Thread(async () =>
 
 thread.Start();
 
+var consumerTasks = new List<Task>();
 
-var consumerTask = Task.Run(async () =>
+foreach (var security in securities)
 {
-    IReadOnlyList<(string key, IReadOnlyList<TimeSeriesLabel> labels, TimeSeriesTuple value)> results;
-    while (true)
-    {
-        results = await db.TimeSeriesMGetAsync(new []{"security=MSFT"});
-        if (results.All(x => x.value != null))
-        {
-            break;
-        }
-        await Task.Delay(500);
-    }
-
-    var timestamp = results.Max(x => (long)x.value.Time);
     
-    while (true)
+    consumerTasks.Add(Task.Run(async () =>
     {
-        var next = await db.TimeSeriesMRangeAsync(timestamp, "+", new[] {"security=MSFT"});
-        if (next.Any(x => !x.values.Any()))
+        IReadOnlyList<(string key, IReadOnlyList<TimeSeriesLabel> labels, TimeSeriesTuple value)> results;
+        while (true)
         {
+            results = await db.TimeSeriesMGetAsync(new []{$"security={security}"});
+            if (results.All(x => x.value != null))
+            {
+                break;
+            }
             await Task.Delay(500);
-            continue;
-        }
-
-        timestamp = next.Max(x => (long)x.values.Last().Time);
-
-        foreach (var element in next.Select(x=>new {val = x.values.Last(),key = x.key}))
-        {
-            Console.WriteLine($"{element.key}, {element.val.Val}");
         }
         
-        await Task.Delay(50);
+        foreach (var element in results)
+        {
+            // Console.WriteLine($"{element.key}, {element.value.Val}");
+        }
 
-    }
+        var timestamp = results.Max(x => (long)x.value.Time);
+    
+        while (true)
+        {
+            var next = await db.TimeSeriesMRangeAsync(timestamp, "+", new[] {$"security={security}"});
+            if (next.Any(x => !x.values.Any()))
+            {
+                await Task.Delay(500);
+                continue;
+            }
 
-});
+            timestamp = next.Max(x => (long)x.values.Last().Time);
 
-await Task.WhenAll(consumerTask);
+            var vector = new List<float>();
+
+            foreach (var element in next.Select(x=>new {val = x.values.Last(),key = x.key}))
+            {
+                vector.Add((float)element.val.Val);
+                // Console.WriteLine($"{element.key}, {element.val.Val}");
+            }
+
+            var floats = vector.ToArray();
+            var bytes = new byte[floats.Length * 4];
+            
+            Buffer.BlockCopy(floats,0,bytes, 0, bytes.Length);
+
+            await db.HashSetAsync($"hash:{security}:{Guid.NewGuid()}", new HashEntry[]
+            {
+                new HashEntry("ticker", security),
+                new HashEntry("vector", bytes)
+            });
+            
+            string s = Encoding.UTF8.GetString(bytes, 0, bytes.Length);
+
+            try
+            {
+                var res = (await db.ExecuteAsync("FT.SEARCH", "stock-vectors", "*=>[KNN 5 @vector $BLOB]", "PARAMS", 2,
+                    "BLOB", bytes, "DIALECT", 2)).ToVSSResult();
+
+                var numAccurate = res.Where(x => x.Ticker == security).Count();
+                Console.WriteLine($"We got {numAccurate}/{res.Count}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(ex);
+            }
+            
+        
+            await Task.Delay(50);
+
+        }
+        
+    }));
+    
+}
+
+
+
+await Task.WhenAll(consumerTasks);
 
 thread.Join();
